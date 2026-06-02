@@ -1,0 +1,423 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+
+from utils.window import locate_game_client
+
+# =========================================================
+# 当前脚本所在文件夹
+# =========================================================
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# =========================================================
+# 游戏窗口内部坐标配置
+# =========================================================
+USE_MANUAL_SELECT = False
+ALLOW_MANUAL_FALLBACK = True
+EXPECTED_GAME_WIDTH = 800
+EXPECTED_GAME_HEIGHT = 600
+GAME_SIZE_TOLERANCE = 20
+
+GRID_X_EDGES = [40, 120, 190, 280, 360, 440, 520, 600, 680, 770]
+GRID_Y_EDGES = [90, 180, 280, 380, 470, 570]
+SUNLIGHT_REL_BBOX = (32, 62, 70, 80)
+
+# =========================================================
+# 类别名称
+# =========================================================
+CLASS_NAMES = [
+    "sunflower",
+    "repeater",
+    "sun",
+    "zombie",
+    "potato_mine",
+    "snowpea",
+    "peashooter",
+    "earthed_potato_mine",
+    "nut",
+    "cherry_bomb",
+    "flag_zombie",
+    "conehead_zombie",
+    "pole_vaulting_zombie",
+    "buckethead_zombie",
+    "newspaper_zombie",
+]
+
+
+# =========================================================
+# 鼠标变量
+# =========================================================
+drawing = False
+ix, iy = -1, -1
+fx, fy = -1, -1
+
+
+# =========================================================
+# 鼠标回调
+# =========================================================
+def draw_rectangle(event, x, y, flags, param):
+    import cv2
+
+    global ix, iy, fx, fy, drawing
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        ix, iy = x, y
+        fx, fy = x, y
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing:
+            fx, fy = x, y
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        fx, fy = x, y
+
+
+# =========================================================
+# 手动框选区域（自动定位失败时的 fallback）
+# =========================================================
+def select_region(window_name):
+    import cv2
+    import numpy as np
+    from PIL import ImageGrab
+
+    global ix, iy, fx, fy
+    ix, iy, fx, fy = -1, -1, -1, -1
+    screen = ImageGrab.grab()
+    screen = cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2BGR)
+    clone = screen.copy()
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, draw_rectangle)
+    print(f"\n请框选 {window_name}")
+    print("ENTER确认")
+
+    while True:
+        temp = clone.copy()
+        if ix != -1:
+            cv2.rectangle(temp, (ix, iy), (fx, fy), (0, 255, 0), 2)
+        cv2.imshow(window_name, temp)
+        key = cv2.waitKey(1)
+        if key == 13:
+            break
+
+    cv2.destroyWindow(window_name)
+    x1 = min(ix, fx)
+    y1 = min(iy, fy)
+    x2 = max(ix, fx)
+    y2 = max(iy, fy)
+    return x1, y1, x2, y2
+
+
+# =========================================================
+# 固定网格映射：输入和输出均基于游戏窗口内部坐标
+# =========================================================
+def _find_grid_index(value, edges):
+    for index, (start, end) in enumerate(zip(edges, edges[1:]), start=1):
+        if start <= value < end:
+            return index
+    if value == edges[-1]:
+        return len(edges) - 1
+    return None
+
+
+def pixel_to_grid(x, y):
+    """Return a 1-based (row, col), or None when outside the lawn."""
+    col = _find_grid_index(x, GRID_X_EDGES)
+    row = _find_grid_index(y, GRID_Y_EDGES)
+    if row is None or col is None:
+        return None
+    return row, col
+
+
+# =========================================================
+# 延后加载模型，导入本模块时不会读取 YOLO 或 CNN 权重
+# =========================================================
+def load_models():
+    import torch
+    import torch.nn as nn
+    import torchvision.transforms as transforms
+    from ultralytics import YOLO
+
+    class DigitCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv2d(1, 32, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+            )
+            self.fc = nn.Sequential(
+                nn.Linear(64 * 7 * 7, 128),
+                nn.ReLU(),
+                nn.Linear(128, 10),
+            )
+
+        def forward(self, x):
+            x = self.conv(x)
+            x = x.view(x.size(0), -1)
+            return self.fc(x)
+
+    yolo_model_path = os.path.join(CURRENT_DIR, "best.pt")
+    if not os.path.exists(yolo_model_path):
+        raise FileNotFoundError(
+            f"找不到YOLO模型：{yolo_model_path}\n请把模型放在脚本同一文件夹"
+        )
+    model = YOLO(yolo_model_path)
+
+    device = torch.device("cpu")
+    digit_model = DigitCNN()
+    cnn_model_path = os.path.join(CURRENT_DIR, "pvz_digit_cnn.pth")
+    if not os.path.exists(cnn_model_path):
+        raise FileNotFoundError(
+            f"找不到CNN模型：{cnn_model_path}\n请把模型放在脚本同一文件夹"
+        )
+    digit_model.load_state_dict(torch.load(cnn_model_path, map_location=device))
+    digit_model.eval()
+    transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((28, 28)),
+            transforms.ToTensor(),
+        ]
+    )
+    return model, digit_model, transform
+
+
+# =========================================================
+# CNN识别阳光数字
+# =========================================================
+def recognize_sunlight_cnn(ocr_bbox, digit_model, transform):
+    import cv2
+    import numpy as np
+    from PIL import ImageGrab
+    import torch
+
+    x1, y1, x2, y2 = ocr_bbox
+    img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+    frame = np.array(img)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((2, 2), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    vertical_sum = np.sum(thresh, axis=0)
+
+    digit_regions = []
+    in_digit = False
+    start = 0
+    for i in range(len(vertical_sum)):
+        if vertical_sum[i] > 0 and not in_digit:
+            in_digit = True
+            start = i
+        elif vertical_sum[i] == 0 and in_digit:
+            in_digit = False
+            end = i
+            if end - start > 3:
+                digit_regions.append((start, end))
+    if in_digit:
+        digit_regions.append((start, len(vertical_sum) - 1))
+
+    result = ""
+    for start, end in digit_regions:
+        digit = thresh[:, start:end]
+        ys, xs = np.where(digit > 0)
+        if len(ys) == 0:
+            continue
+        y_min = np.min(ys)
+        y_max = np.max(ys)
+        digit = digit[y_min : y_max + 1, :]
+
+        h, w = digit.shape
+        size = max(h, w) + 10
+        canvas = np.zeros((size, size), dtype=np.uint8)
+        x_offset = (size - w) // 2
+        y_offset = (size - h) // 2
+        canvas[y_offset : y_offset + h, x_offset : x_offset + w] = digit
+
+        canvas = cv2.resize(canvas, (28, 28))
+        tensor = transform(canvas).unsqueeze(0)
+
+        with torch.no_grad():
+            output = digit_model(tensor)
+            pred = output.argmax(1).item()
+        result += str(pred)
+
+    return result or "0"
+
+
+def _relative_bbox_to_screen(game_bbox, relative_bbox):
+    game_x1, game_y1, _, _ = game_bbox
+    x1, y1, x2, y2 = relative_bbox
+    return game_x1 + x1, game_y1 + y1, game_x1 + x2, game_y1 + y2
+
+
+def _warn_if_unexpected_game_size(game_bbox):
+    x1, y1, x2, y2 = game_bbox
+    width = x2 - x1
+    height = y2 - y1
+    if (
+        abs(width - EXPECTED_GAME_WIDTH) > GAME_SIZE_TOLERANCE
+        or abs(height - EXPECTED_GAME_HEIGHT) > GAME_SIZE_TOLERANCE
+    ):
+        print(
+            "[warning] Game Region differs from expected "
+            f"{EXPECTED_GAME_WIDTH}x{EXPECTED_GAME_HEIGHT}: got {width}x{height}"
+        )
+
+
+def configure_regions():
+    if USE_MANUAL_SELECT:
+        game_bbox = select_region("Game Region")
+    else:
+        try:
+            client = locate_game_client()
+            game_bbox = (
+                int(client["x"]),
+                int(client["y"]),
+                int(client["x"]) + int(client["width"]),
+                int(client["y"]) + int(client["height"]),
+            )
+            print(f"自动定位窗口标题：{client['title']}")
+            print(f"client area 左上角：({client['x']}, {client['y']})")
+            print(f"client area 尺寸：({client['width']}, {client['height']})")
+        except RuntimeError as exc:
+            if not ALLOW_MANUAL_FALLBACK:
+                raise
+            print(f"[warning] 自动定位失败：{exc}")
+            print("回退到手动框选 Game Region。")
+            game_bbox = select_region("Game Region")
+
+    _warn_if_unexpected_game_size(game_bbox)
+    ocr_bbox = _relative_bbox_to_screen(game_bbox, SUNLIGHT_REL_BBOX)
+    return game_bbox, ocr_bbox
+
+
+# =========================================================
+# 自适应显示
+# =========================================================
+def resize_display(img):
+    import cv2
+
+    h, w = img.shape[:2]
+    max_w = 1400
+    max_h = 900
+    scale = min(max_w / w, max_h / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(img, (new_w, new_h))
+
+
+def _sunlight_to_int(sunlight):
+    try:
+        return int(sunlight) if sunlight else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+# =========================================================
+# 主程序
+# =========================================================
+def main():
+    import cv2
+    import numpy as np
+    from PIL import ImageGrab
+
+    print("\n========== PVZ AI 输入层 ==========")
+    game_bbox, ocr_bbox = configure_regions()
+    model, digit_model, transform = load_models()
+
+    print("\n开始实时识别...")
+    print("ESC退出\n")
+
+    cv2.namedWindow("PVZ Detection", cv2.WINDOW_NORMAL)
+    json_output_path = os.path.join(CURRENT_DIR, "pvz_data.json")
+    txt_output_path = os.path.join(CURRENT_DIR, "pvz_data.txt")
+
+    while True:
+        loop_start = time.time()
+        game_x1, game_y1, game_x2, game_y2 = game_bbox
+        img = ImageGrab.grab(bbox=(game_x1, game_y1, game_x2, game_y2))
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        results = model.predict(frame, conf=0.5, verbose=False)
+        data = {
+            "sunlight": 0,
+            "plants": [],
+            "zombie": [],
+            "falling_sun": [],
+        }
+        boxes = results[0].boxes
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            name = CLASS_NAMES[cls_id]
+            x_min, y_min, x_max, y_max = map(int, box.xyxy[0])
+
+            if name in [
+                "sunflower",
+                "repeater",
+                "potato_mine",
+                "snowpea",
+                "peashooter",
+                "earthed_potato_mine",
+                "nut",
+                "cherry_bomb",
+            ]:
+                cx = int((x_min + x_max) / 2)
+                cy = int((y_min + y_max) / 2)
+                grid_position = pixel_to_grid(cx, cy)
+                if grid_position is not None:
+                    row, col = grid_position
+                    data["plants"].append({"type": name, "row": row, "col": col})
+
+            elif "zombie" in name:
+                cx = int((x_min + x_max) / 2)
+                cy = int(y_min + (y_max - y_min) * 2 / 3)
+                grid_position = pixel_to_grid(cx, cy)
+                if grid_position is not None:
+                    row, col = grid_position
+                    data["zombie"].append({"type": name, "row": row, "col": col})
+
+            elif name == "sun":
+                cx = int((x_min + x_max) / 2)
+                cy = int((y_min + y_max) / 2)
+                data["falling_sun"].append({"x": cx, "y": cy})
+
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                name,
+                (x_min, y_min - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+            )
+
+        sunlight = recognize_sunlight_cnn(ocr_bbox, digit_model, transform)
+        data["sunlight"] = _sunlight_to_int(sunlight)
+        json_str = json.dumps(data, indent=4, ensure_ascii=False)
+        print(json_str)
+
+        with open(json_output_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=4, ensure_ascii=False)
+
+        with open(txt_output_path, "w", encoding="utf-8") as file:
+            file.write(json_str)
+
+        cv2.imshow("PVZ Detection", resize_display(frame))
+        if cv2.waitKey(1) == 27:
+            break
+
+        remain = 0.3 - (time.time() - loop_start)
+        if remain > 0:
+            time.sleep(remain)
+
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
