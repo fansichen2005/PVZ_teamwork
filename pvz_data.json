@@ -1,0 +1,42 @@
+{
+    "sunlight": 50,
+    "plants": [
+        {
+            "type": "sunflower",
+            "row": 1,
+            "col": 1
+        },
+        {
+            "type": "sunflower",
+            "row": 2,
+            "col": 1
+        },
+        {
+            "type": "sunflower",
+            "row": 3,
+            "col": 1
+        },
+        {
+            "type": "potato_mine",
+            "row": 4,
+            "col": 2
+        }
+    ],
+    "zombie": [
+        {
+            "type": "newspaper_zombie",
+            "row": 3,
+            "col": 5
+        }
+    ],
+    "falling_sun": [
+        {
+            "x": 619,
+            "y": 142
+        },
+        {
+            "x": 197,
+            "y": 417
+        }
+    ]
+}

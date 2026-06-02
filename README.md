@@ -111,3 +111,104 @@ zombie、flag_zombie、conehead_zombie、buckethead_zombie、newspaper_zombie、
 
 ### 其他
 sun（阳光）
+
+---
+
+## 八、鼠标控制模块 (control/)
+
+将 LLM 输出的高层次指令转换为精确的鼠标操作，实现种植、铲除、收集阳光等游戏操作。
+
+### 核心组件
+
+#### 1. GameExecutor (executor.py)
+游戏执行器类，提供以下方法：
+- `plant(plant, row, col)` - 种植植物
+- `remove_plant(row, col)` - 铲除植物
+- `collect_sun(x, y)` - 收集阳光
+- `execute(actions)` - 批量执行指令列表
+
+**LLM 指令格式：**
+```python
+actions = [
+    {"action": "plant", "plant": "peashooter", "row": 2, "col": 5},
+    {"action": "remove", "row": 1, "col": 3},
+    {"action": "collect_sun", "x": 300, "y": 400}
+]
+```
+
+#### 2. 阳光自动收集器 (auto_collect_sun.py)
+独立运行的阳光收集程序，**无需 LLM 决策**：
+- 实时监控 `pvz_data.json` 文件
+- 自动读取 `falling_sun` 数组中的阳光坐标
+- 逐个点击收集所有掉落的阳光
+- 最高优先级，不影响 LLM 决策流程
+
+**运行方式：**
+```bash
+# 先启动视觉识别程序
+python visual_program.py
+
+# 在另一个终端启动阳光收集器
+python control/auto_collect_sun.py
+```
+
+**设计理念：** 收集阳光是零成本的高频操作，不需要 LLM 参与决策，直接响应视觉识别结果即可。
+
+### 测试工具
+
+#### LLM 指令模拟测试
+```bash
+python control/llm_simulation_test.py
+```
+自动打开画图软件，执行 10 条预设的 LLM 指令，演示完整的执行流程。
+
+#### 阳光收集器测试
+```bash
+# 终端1：启动阳光收集器
+python control/auto_collect_sun.py
+
+# 终端2：运行测试数据生成器
+python control/test_sun_collector.py
+```
+测试程序会每 2-4 秒生成随机阳光坐标，观察收集器是否自动点击。
+
+#### 鼠标坐标显示工具
+```bash
+python control/show_mouse_position.py
+```
+实时显示鼠标坐标，用于测量游戏界面关键位置。
+
+### 依赖安装
+```bash
+pip install pyautogui
+```
+
+---
+
+## 九、完整工作流程
+
+```
+1. 视觉识别 (visual_program.py)
+   ↓
+   实时输出 pvz_data.json
+   ↓
+2. 阳光收集器 (auto_collect_sun.py) ← 自动收集阳光
+   ↓
+3. LLM 决策层（待实现）← 读取游戏状态，制定策略
+   ↓
+4. 游戏执行器 (executor.py) ← 执行种植、铲除等操作
+```
+
+---
+
+## 十、项目进度
+
+- [x] 视觉识别模块 (YOLO + CNN)
+- [x] 鼠标控制基础框架
+- [x] 阳光自动收集器
+- [x] LLM 指令模拟测试
+- [ ] 游戏坐标精确测量
+- [ ] LLM 决策层实现
+- [ ] 完整系统集成测试
+
+详见 [PROJECT_LOG.md](PROJECT_LOG.md)
